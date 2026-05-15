@@ -1,0 +1,1401 @@
+// Auto-converted from /tmp/df-smallvec-2.0.0-alpha.12/smallvec-2.0.0-alpha.12/src/lib.rs
+
+// [unsupported item]
+// [unsupported item]
+#[cfg(test)]
+mod tests;
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+use alloc::alloc::Layout;
+use core::borrow::Borrow;
+use core::borrow::BorrowMut;
+use core::fmt::Debug;
+use core::hash::{ Hash, Hasher };
+use core::marker::PhantomData;
+use core::mem::align_of;
+use core::mem::size_of;
+use core::mem::ManuallyDrop;
+use core::mem::MaybeUninit;
+use core::ptr::addr_of;
+use core::ptr::addr_of_mut;
+use core::ptr::copy;
+use core::ptr::copy_nonoverlapping;
+use core::ptr::NonNull;
+#[cfg(feature = "bytes")] use bytes::{ buf::UninitSlice, BufMut };
+#[cfg(feature = "malloc_size_of")] use malloc_size_of::{ MallocShallowSizeOf, MallocSizeOf, MallocSizeOfOps };
+#[cfg(feature = "serde")] use serde_core::{ de::{ Deserialize, Deserializer, SeqAccess, Visitor }, ser::{ Serialize, SerializeSeq, Serializer } };
+#[cfg(feature = "std")] use std::io;
+/// Error type for APIs with fallible heap allocation
+#[derive(Debug)]
+pub enum CollectionAllocErr {
+ CapacityOverflow,
+ AllocErr { layout: Layout },
+}
+
+impl core::fmt::Display for CollectionAllocErr {
+ fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+ write!(f, "Allocation error: {:?}", self)
+ }
+ 
+}
+
+impl core::error::Error for CollectionAllocErr {
+}
+
+// [unsupported item]
+#[inline]
+fn infallible<T>(result: Result<T, CollectionAllocErr>) -> T {
+ match result { Ok(x) => x, Err(CollectionAllocErr::CapacityOverflow) => panic!("capacity overflow"), Err(CollectionAllocErr::AllocErr { layout }) => alloc::alloc::handle_alloc_error(layout) }
+}
+
+#[inline]
+/// A local copy of [`core::slice::range`]. The latter function is unstable
+/// and thus cannot be used yet.
+fn slice_range<R>(range: R, bounds: core::ops::RangeTo<usize>) -> core::ops::Range<usize> where R: core::ops::RangeBounds<usize> {
+ let len = bounds.end;
+ let start = match range.start_bound() { core::ops::Bound::Included(&start) => start, core::ops::Bound::Excluded(start) => start.checked_add(1).unwrap_or_else(| | panic!("attempted to index slice from after maximum usize")), core::ops::Bound::Unbounded => 0 };
+ let end = match range.end_bound() { core::ops::Bound::Included(end) => end.checked_add(1).unwrap_or_else(| | panic!("attempted to index slice up to maximum usize")), core::ops::Bound::Excluded(&end) => end, core::ops::Bound::Unbounded => len };
+ if start > end { panic!("slice index starts at {start} but ends at {end}"); }
+ if end > len { panic!("range end index {end} out of range for slice of length {len}"); }
+ core::ops::Range { start, end }
+}
+
+impl<T, const N: usize> RawSmallVec<T, N> {
+ fn is_zst() -> bool {
+ size_of::<T>() == 0
+ }
+ 
+ fn new() -> Self {
+ Self::new_inline(MaybeUninit::uninit())
+ }
+ 
+ fn new_inline(inline: MaybeUninit<[T; N]>) -> Self {
+ Self { inline: ManuallyDrop::new(inline) }
+ }
+ 
+ fn new_heap(ptr: NonNull<T>, capacity: usize) -> Self {
+ Self { heap: (ptr, capacity) }
+ }
+ 
+ fn as_ptr_inline(&self) -> *const T {
+ (unsafe { addr_of!(self.inline) }) as * const T
+ }
+ 
+ fn as_mut_ptr_inline(&mut self) -> *mut T {
+ (unsafe { addr_of_mut!(self.inline) }) as * mut T
+ }
+ 
+ fn as_ptr_heap(&self) -> *const T {
+ self.heap.0.as_ptr()
+ }
+ 
+ fn as_mut_ptr_heap(&mut self) -> *mut T {
+ self.heap.0.as_ptr()
+ }
+ 
+ fn try_grow_raw(&mut self, len: TaggedLen, new_capacity: usize) -> Result<(), CollectionAllocErr> {
+ use alloc::alloc::{ alloc, realloc };
+ debug_assert!(! Self::is_zst());
+ debug_assert!(new_capacity > 0);
+ debug_assert!(new_capacity >= len.value(Self::is_zst()));
+ let was_on_heap = len.on_heap(Self::is_zst());
+ let ptr = if was_on_heap { self.as_mut_ptr_heap() } else { self.as_mut_ptr_inline() };
+ let len = len.value(Self::is_zst());
+ let new_layout = Layout::array::<T>(new_capacity).map_err(| _ | CollectionAllocErr::CapacityOverflow) ?;
+ if new_layout.size() > isize::MAX as usize { return Err(CollectionAllocErr::CapacityOverflow); }
+ let new_ptr = if len == 0 || ! was_on_heap { let new_ptr = alloc(new_layout) as * mut T; let new_ptr = NonNull::new(new_ptr).ok_or(CollectionAllocErr::AllocErr { layout: new_layout }) ?; copy_nonoverlapping(ptr, new_ptr.as_ptr(), len); new_ptr } else { let old_layout = Layout::from_size_align_unchecked(self.heap.1 * size_of::<T>(), align_of::<T>()); let new_ptr = realloc(ptr as * mut u8, old_layout, new_layout.size()) as * mut T; NonNull::new(new_ptr).ok_or(CollectionAllocErr::AllocErr { layout: new_layout }) ? };
+ *self = Self::new_heap(new_ptr, new_capacity);
+ Ok(())
+ }
+ 
+}
+
+/// Vec guarantees that its length is always less than [`isize::MAX`] in *bytes*.
+/// 
+/// For a non ZST, this means that the length is less than `isize::MAX` objects, which implies we
+/// have at least one free bit we can use. We use the least significant bit for the tag. And store
+/// the length in the `usize::BITS - 1` most significant bits.
+/// 
+/// For a ZST, we never use the heap, so we just store the length directly.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct TaggedLen {
+ (usize),
+}
+
+impl TaggedLen {
+ pub fn new(len: usize, on_heap: bool, is_zst: bool) -> Self {
+ if is_zst { debug_assert!(! on_heap); TaggedLen(len) } else { debug_assert!(len < isize::MAX as usize); TaggedLen((len << 1) | on_heap as usize) }
+ }
+ 
+ pub fn on_heap(self, is_zst: bool) -> bool {
+ if is_zst { false } else { (self.0 &1_usize) == 1 }
+ }
+ 
+ pub fn value(self, is_zst: bool) -> usize {
+ if is_zst { self.0 } else { self.0>> 1 }
+ }
+ 
+}
+
+#[repr(C)]
+pub struct SmallVec<T, const N: usize> {
+ len: TaggedLen,
+ raw: RawSmallVec<T, N>,
+ _marker: PhantomData<T>,
+}
+
+unsafe impl<T: Send, const N: usize> Send for SmallVec<T, N> {
+}
+
+unsafe impl<T: Sync, const N: usize> Sync for SmallVec<T, N> {
+}
+
+impl<T, const N: usize> Default for SmallVec<T, N> {
+ fn default() -> Self {
+ Self::new()
+ }
+ 
+}
+
+/// An iterator that removes the items from a `SmallVec` and yields them by value.
+/// 
+/// Returned from [`SmallVec::drain`][1].
+/// 
+/// [1]: struct.SmallVec.html#method.drain
+pub struct Drain<a, T: a, const N: usize> {
+ tail_start: usize,
+ tail_len: usize,
+ iter: core::slice::Iter<'a, T>,
+ vec: core::ptr::NonNull<SmallVec<T, N>>,
+}
+
+impl<a, T: a, const N: usize> Iterator for Drain<'a, T, N> {
+ type Item = T;
+ fn next(&mut self) -> Option<T> {
+ self.iter.next().map(| reference | unsafe { core::ptr::read(reference) })
+ }
+ 
+ fn size_hint(&self) ->(usize, Option<usize>) {
+ self.iter.size_hint()
+ }
+ 
+}
+
+impl<a, T: a, const N: usize> DoubleEndedIterator for Drain<'a, T, N> {
+ fn next_back(&mut self) -> Option<T> {
+ self.iter.next_back().map(| reference | unsafe { core::ptr::read(reference) })
+ }
+ 
+}
+
+impl<T, const N: usize> ExactSizeIterator for Drain<'_, T, N> {
+ fn len(&self) -> usize {
+ self.iter.len()
+ }
+ 
+}
+
+impl<T, const N: usize> core::iter::FusedIterator for Drain<'_, T, N> {
+}
+
+impl<a, T: a, const N: usize> Drop for Drain<'a, T, N> {
+ fn drop(&mut self) {
+ /// Moves back the un-`Drain`ed elements to restore the original `Vec`.
+ struct DropGuard<r, a, T, const N: usize> {
+ (&mut Drain<'a, T, N>),
+ }
+ 
+ impl<r, a, T, const N: usize> Drop for DropGuard<'r, 'a, T, N> {
+ fn drop(&mut self) {
+ if self.0.tail_len > 0 { unsafe { let source_vec = self.0.vec.as_mut(); let start = source_vec.len(); let tail = self.0.tail_start; if tail != start { let ptr = source_vec.as_mut_ptr(); let src = ptr.add(tail); let dst = ptr.add(start); core::ptr::copy(src, dst, self.0.tail_len); } source_vec.set_len(start + self.0.tail_len); } }
+ }
+ 
+ }
+ 
+ let iter = core::mem::take(&mut self.iter);
+ let drop_len = iter.len();
+ let mut vec = self.vec;
+ if SmallVec::<T, N>::is_zst() { unsafe { let vec = vec.as_mut(); let old_len = vec.len(); vec.set_len(old_len + drop_len + self.tail_len); vec.truncate(old_len + self.tail_len); } return; }
+ let _guard = DropGuard(self);
+ if drop_len == 0 { return; }
+ let drop_ptr = iter.as_slice().as_ptr();
+ unsafe { let vec_ptr = vec.as_mut().as_mut_ptr(); let drop_offset = drop_ptr.offset_from(vec_ptr) as usize; let to_drop = core::ptr::slice_from_raw_parts_mut(vec_ptr.add(drop_offset), drop_len); core::ptr::drop_in_place(to_drop); }
+ }
+ 
+}
+
+impl<T, const N: usize> Drain<'_, T, N> {
+ pub fn as_slice(&self) -> &[T] {
+ self.iter.as_slice()
+ }
+ 
+ fn fill(&mut self, replace_with: &mut I) -> bool {
+ let vec = unsafe { self.vec.as_mut() };
+ let range_start = vec.len();
+ let range_end = self.tail_start;
+ let range_slice = unsafe { core::slice::from_raw_parts_mut(vec.as_mut_ptr().add(range_start), range_end - range_start) };
+ for place in range_slice { if let Some(new_item) = replace_with.next() { unsafe { core::ptr::write(place, new_item) }; vec.set_len(vec.len() + 1); } else { return false; } }
+ true
+ }
+ 
+ fn move_tail(&mut self, additional: usize) {
+ let vec = unsafe { self.vec.as_mut() };
+ let len = self.tail_start + self.tail_len;
+ let old_len = vec.len();
+ vec.set_len(len);
+ vec.reserve(additional);
+ vec.set_len(old_len);
+ let new_tail_start = self.tail_start + additional;
+ unsafe { let src = vec.as_ptr().add(self.tail_start); let dst = vec.as_mut_ptr().add(new_tail_start); core::ptr::copy(src, dst, self.tail_len); }
+ self.tail_start = new_tail_start;
+ }
+ 
+}
+
+#[cfg(feature = "extract_if")]
+/// An iterator which uses a closure to determine if an element should be removed.
+/// 
+/// Returned from [`SmallVec::extract_if`][1].
+/// 
+/// [1]: struct.SmallVec.html#method.extract_if
+pub struct ExtractIf<a, T, const N: usize, F> {
+ vec: &mut SmallVec<T, N>,
+ idx: usize,
+ end: usize,
+ del: usize,
+ old_len: usize,
+ pred: F,
+}
+
+#[cfg(feature = "extract_if")]
+impl<T, const N: usize, F> core::fmt::Debug for ExtractIf<'_, T, N, F> where F: FnMut, T: core::fmt::Debug {
+ fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+ f.debug_tuple("ExtractIf").field(&self.vec.as_slice()).finish()
+ }
+ 
+}
+
+#[cfg(feature = "extract_if")]
+impl<T, F, const N: usize> Iterator for ExtractIf<'_, T, N, F> where F: FnMut {
+ type Item = T;
+ fn next(&mut self) -> Option<T> {
+ unsafe { while self.idx<self.end { let i = self.idx; let v = core::slice::from_raw_parts_mut(self.vec.as_mut_ptr(), self.old_len); let drained = (self.pred)(&mut v [i]); self.idx += 1; if drained { self.del += 1; return Some(core::ptr::read(&v [i])); } else if self.del> 0 { let del = self.del; let src: *const T = &v [i]; let dst: *mut T = &mut v [i - del]; core::ptr::copy_nonoverlapping(src, dst, 1); } } None }
+ }
+ 
+ fn size_hint(&self) ->(usize, Option<usize>) {
+ (0, Some(self.end - self.idx))
+ }
+ 
+}
+
+#[cfg(feature = "extract_if")]
+impl<T, F, const N: usize> Drop for ExtractIf<'_, T, N, F> where F: FnMut {
+ fn drop(&mut self) {
+ unsafe { if self.idx<self.old_len &&self.del> 0 { let ptr = self.vec.as_mut_ptr(); let src = ptr.add(self.idx); let dst = src.sub(self.del); let tail_len = self.old_len - self.idx; src.copy_to(dst, tail_len); } self.vec.set_len(self.old_len - self.del); }
+ }
+ 
+}
+
+pub struct Splice<a, I: Iterator + a, const N: usize> {
+ drain: Drain<'a, I::Item, N>,
+ replace_with: I,
+}
+
+impl<a, I, const N: usize> core::fmt::Debug for Splice<'a, I, N> where I: Debug + Iterator + a, Iterator::Item: Debug {
+ fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+ f.debug_tuple("Splice").field(&self.drain).finish()
+ }
+ 
+}
+
+impl<I: Iterator, const N: usize> Iterator for Splice<'_, I, N> {
+ type Item = I::Item;
+ fn next(&mut self) -> Option<Self::Item> {
+ self.drain.next()
+ }
+ 
+ fn size_hint(&self) ->(usize, Option<usize>) {
+ self.drain.size_hint()
+ }
+ 
+}
+
+impl<I: Iterator, const N: usize> DoubleEndedIterator for Splice<'_, I, N> {
+ fn next_back(&mut self) -> Option<Self::Item> {
+ self.drain.next_back()
+ }
+ 
+}
+
+impl<I: Iterator, const N: usize> ExactSizeIterator for Splice<'_, I, N> {
+}
+
+impl<I: Iterator, const N: usize> Drop for Splice<'_, I, N> {
+ fn drop(&mut self) {
+ self.drain.by_ref().for_each(drop);
+ self.drain.iter = [] . iter();
+ unsafe { if self.drain.tail_len == 0 { self.drain.vec.as_mut().extend(self.replace_with.by_ref()); return; } if ! self.drain.fill(&mut self.replace_with) { return; } let(lower_bound, _upper_bound) = self.replace_with.size_hint(); if lower_bound > 0 { self.drain.move_tail(lower_bound); if ! self.drain.fill(&mut self.replace_with) { return; } } let mut collected = self.replace_with.by_ref().collect::<SmallVec<I::Item, N> >().into_iter(); if collected.len() > 0 { self.drain.move_tail(collected.len()); let filled = self.drain.fill(&mut collected); debug_assert!(filled); debug_assert_eq!(collected.len(), 0); } }
+ }
+ 
+}
+
+/// An iterator that consumes a `SmallVec` and yields its items by value.
+/// 
+/// Returned from [`SmallVec::into_iter`][1].
+/// 
+/// [1]: struct.SmallVec.html#method.into_iter
+pub struct IntoIter<T, const N: usize> {
+ raw: RawSmallVec<T, N>,
+ begin: usize,
+ end: TaggedLen,
+ _marker: PhantomData<T>,
+}
+
+unsafe impl<T, const N: usize> Send for IntoIter<T, N> where T: Send {
+}
+
+unsafe impl<T, const N: usize> Sync for IntoIter<T, N> where T: Sync {
+}
+
+impl<T, const N: usize> IntoIter<T, N> {
+ fn is_zst() -> bool {
+ size_of::<T>() == 0
+ }
+ 
+ fn as_ptr(&self) -> *const T {
+ let on_heap = self.end.on_heap(Self::is_zst());
+ if on_heap { unsafe { self.raw.as_ptr_heap() } } else { self.raw.as_ptr_inline() }
+ }
+ 
+ fn as_mut_ptr(&mut self) -> *mut T {
+ let on_heap = self.end.on_heap(Self::is_zst());
+ if on_heap { unsafe { self.raw.as_mut_ptr_heap() } } else { self.raw.as_mut_ptr_inline() }
+ }
+ 
+ pub fn as_slice(&self) -> &[T] {
+ unsafe { let ptr = self.as_ptr(); core::slice::from_raw_parts(ptr.add(self.begin), self.end.value(Self::is_zst()) - self.begin ) }
+ }
+ 
+ pub fn as_mut_slice(&mut self) -> &mut [T] {
+ unsafe { let ptr = self.as_mut_ptr(); core::slice::from_raw_parts_mut(ptr.add(self.begin), self.end.value(Self::is_zst()) - self.begin ) }
+ }
+ 
+}
+
+impl<T, const N: usize> Iterator for IntoIter<T, N> {
+ type Item = T;
+ fn next(&mut self) -> Option<Self::Item> {
+ if self.begin == self.end.value(Self::is_zst()) { None } else { unsafe { let ptr = self.as_mut_ptr(); let value = ptr.add(self.begin).read(); self.begin += 1; Some(value) } }
+ }
+ 
+ fn size_hint(&self) ->(usize, Option<usize>) {
+ let size = self.end.value(Self::is_zst()) - self.begin;
+ (size, Some(size))
+ }
+ 
+}
+
+impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
+ fn next_back(&mut self) -> Option<Self::Item> {
+ let mut end = self.end.value(Self::is_zst());
+ if self.begin == end { None } else { unsafe { let ptr = self.as_mut_ptr(); let on_heap = self.end.on_heap(Self::is_zst()); end -= 1; self.end = TaggedLen::new(end, on_heap, Self::is_zst()); let value = ptr.add(end).read(); Some(value) } }
+ }
+ 
+}
+
+impl<T, const N: usize> ExactSizeIterator for IntoIter<T, N> {
+}
+
+impl<T, const N: usize> core::iter::FusedIterator for IntoIter<T, N> {
+}
+
+impl<T, const N: usize> SmallVec<T, N> {
+ pub fn new() -> SmallVec<T, N> {
+ Self { len: TaggedLen::new(0, false, Self::is_zst()), raw: RawSmallVec::new(), _marker: PhantomData }
+ }
+ 
+ pub fn with_capacity(capacity: usize) -> Self {
+ let mut this = Self::new();
+ if capacity > Self::inline_size() { this.grow(capacity); }
+ this
+ }
+ 
+ pub fn from_buf(elements: [T; S]) -> Self {
+ const { assert!(S <= N); }
+ let _ = MaybeUninit::uninit();
+ unsafe { copy_nonoverlapping(elements.as_ptr(), buf.as_mut_ptr() as * mut T, S); }
+ core::mem::forget(elements);
+ Self { len: TaggedLen::new(S, false, Self::is_zst()), raw: RawSmallVec::new_inline(buf), _marker: PhantomData }
+ }
+ 
+ pub fn from_buf_and_len(buf: [T; N], len: usize) -> Self {
+ assert!(len <= N);
+ let mut vec = Self { len: TaggedLen::new(len, false, Self::is_zst()), raw: RawSmallVec::new_inline(MaybeUninit::new(buf)), _marker: PhantomData };
+ unsafe { let remainder_ptr = vec.raw.as_mut_ptr_inline().add(len); let remainder_len = N - len; core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(remainder_ptr, remainder_len )); }
+ vec
+ }
+ 
+ pub fn from_buf_and_len_unchecked(buf: MaybeUninit<[T; N]>, len: usize) -> Self {
+ debug_assert!(len <= N);
+ Self { len: TaggedLen::new(len, false, Self::is_zst()), raw: RawSmallVec::new_inline(buf), _marker: PhantomData }
+ }
+ 
+}
+
+impl<T, const N: usize> SmallVec<T, N> {
+ fn is_zst() -> bool {
+ size_of::<T>() == 0
+ }
+ 
+ pub fn from_vec(vec: Vec<T>) -> Self {
+ if vec.capacity() == 0 { return Self::new(); }
+ if Self::is_zst() { let mut vec = vec; let len = vec.len(); unsafe { vec.set_len(0) }; Self { len: TaggedLen::new(len, false, Self::is_zst()), raw: RawSmallVec::new(), _marker: PhantomData } } else { let mut vec = ManuallyDrop::new(vec); let len = vec.len(); let cap = vec.capacity(); let ptr = unsafe { NonNull::new_unchecked(vec.as_mut_ptr()) }; Self { len: TaggedLen::new(len, true, Self::is_zst()), raw: RawSmallVec::new_heap(ptr, cap), _marker: PhantomData } }
+ }
+ 
+ fn set_on_heap(&mut self) {
+ self.len = TaggedLen::new(self.len(), true, Self::is_zst());
+ }
+ 
+ fn set_inline(&mut self) {
+ self.len = TaggedLen::new(self.len(), false, Self::is_zst());
+ }
+ 
+ pub fn set_len(&mut self, new_len: usize) {
+ debug_assert!(new_len <= self.capacity());
+ let on_heap = self.len.on_heap(Self::is_zst());
+ self.len = TaggedLen::new(new_len, on_heap, Self::is_zst());
+ }
+ 
+ pub fn inline_size() -> usize {
+ if Self::is_zst() { usize::MAX } else { N }
+ }
+ 
+ pub fn len(&self) -> usize {
+ self.len.value(Self::is_zst())
+ }
+ 
+ pub fn is_empty(&self) -> bool {
+ self.len() == 0
+ }
+ 
+ pub fn capacity(&self) -> usize {
+ if self.len.on_heap(Self::is_zst()) { unsafe { self.raw.heap.1 } } else { Self::inline_size() }
+ }
+ 
+ pub fn spilled(&self) -> bool {
+ self.len.on_heap(Self::is_zst())
+ }
+ 
+ pub fn split_off(&mut self, at: usize) -> Self {
+ let len = self.len();
+ assert!(at <= len);
+ let other_len = len - at;
+ let mut other = Self::with_capacity(other_len);
+ unsafe { self.set_len(at); other.set_len(other_len); core::ptr::copy_nonoverlapping(self.as_ptr().add(at), other.as_mut_ptr(), other_len); }
+ other
+ }
+ 
+ pub fn drain(&mut self, range: R) -> Drain<'_, T, N> {
+ let len = self.len();
+ let _ = slice_range(range, .. len);
+ unsafe { self.set_len(start); let range_slice = core::slice::from_raw_parts(self.as_ptr().add(start), end - start); Drain { tail_start: end, tail_len: len - end, iter: range_slice.iter(), vec: core::ptr::NonNull::new_unchecked(self as * mut _) } }
+ }
+ 
+ pub fn extract_if(&mut self, range: R, filter: F) -> ExtractIf<'_, T, N, F> {
+ let old_len = self.len();
+ let _ = slice_range(range, .. old_len);
+ unsafe { self.set_len(0); }
+ ExtractIf { vec: self, idx: start, end, del: 0, old_len, pred: filter }
+ }
+ 
+ pub fn splice(&mut self, range: R, replace_with: I) -> Splice<'_, I::IntoIter, N> {
+ Splice { drain: self.drain(range), replace_with: replace_with.into_iter() }
+ }
+ 
+ pub fn push(&mut self, value: T) {
+ let len = self.len();
+ if len == self.capacity() { self.reserve(1); }
+ let ptr = unsafe { self.as_mut_ptr().add(len) };
+ unsafe { ptr.write(value) };
+ unsafe { self.set_len(len + 1) }
+ }
+ 
+ pub fn pop(&mut self) -> Option<T> {
+ if self.is_empty() { None } else { let len = self.len() - 1; unsafe { self.set_len(len) }; let value = unsafe { self.as_mut_ptr().add(len).read() }; Some(value) }
+ }
+ 
+ pub fn pop_if(&mut self, predicate: impl FnOnce) -> Option<T> {
+ let last = self.last_mut() ?;
+ if predicate(last) { self.pop() } else { None }
+ }
+ 
+ pub fn append(&mut self, other: &mut SmallVec<T, M>) {
+ let len = self.len();
+ let other_len = other.len();
+ let total_len = len + other_len;
+ if total_len > self.capacity() { self.reserve(other_len); }
+ let ptr = unsafe { self.as_mut_ptr().add(len) };
+ unsafe { other.set_len(0) }
+ unsafe { copy_nonoverlapping(other.as_ptr(), ptr, other_len) };
+ unsafe { self.set_len(total_len) }
+ }
+ 
+ pub fn grow(&mut self, new_capacity: usize) {
+ infallible(self.try_grow(new_capacity));
+ }
+ 
+ pub fn try_grow(&mut self, new_capacity: usize) -> Result<(), CollectionAllocErr> {
+ if Self::is_zst() { return Ok(()); }
+ let len = self.len();
+ assert!(new_capacity >= len);
+ if new_capacity > Self::inline_size() { let result = unsafe { self.raw.try_grow_raw(self.len, new_capacity) }; if result.is_ok() { unsafe { self.set_on_heap() }; } result } else { if self.spilled() { unsafe { let(ptr, old_cap) = self.raw.heap; copy_nonoverlapping(ptr.as_ptr(), self.raw.as_mut_ptr_inline(), len); drop(DropDealloc { ptr: ptr.cast(), size_bytes: old_cap * size_of::<T>(), align: align_of::<T>() }); self.set_inline(); } } Ok(()) }
+ }
+ 
+ pub fn reserve(&mut self, additional: usize) {
+ if additional > self.capacity() - self.len() { let new_capacity = infallible(self.len().checked_add(additional).and_then(usize::checked_next_power_of_two).ok_or(CollectionAllocErr::CapacityOverflow) ); self.grow(new_capacity); }
+ }
+ 
+ pub fn try_reserve(&mut self, additional: usize) -> Result<(), CollectionAllocErr> {
+ if additional > self.capacity() - self.len() { let new_capacity = self.len().checked_add(additional).and_then(usize::checked_next_power_of_two).ok_or(CollectionAllocErr::CapacityOverflow) ?; self.try_grow(new_capacity) } else { Ok(()) }
+ }
+ 
+ pub fn reserve_exact(&mut self, additional: usize) {
+ if additional > self.capacity() - self.len() { let new_capacity = infallible(self.len().checked_add(additional).ok_or(CollectionAllocErr::CapacityOverflow) ); self.grow(new_capacity); }
+ }
+ 
+ pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), CollectionAllocErr> {
+ if additional > self.capacity() - self.len() { let new_capacity = self.len().checked_add(additional).ok_or(CollectionAllocErr::CapacityOverflow) ?; self.try_grow(new_capacity) } else { Ok(()) }
+ }
+ 
+ pub fn shrink_to_fit(&mut self) {
+ if ! self.spilled() { return; }
+ let len = self.len();
+ if len <= Self::inline_size() { unsafe { let(ptr, capacity) = self.raw.heap; self.raw = RawSmallVec::new_inline(MaybeUninit::uninit()); copy_nonoverlapping(ptr.as_ptr(), self.raw.as_mut_ptr_inline(), len); self.set_inline(); alloc::alloc::dealloc(ptr.cast().as_ptr(), Layout::from_size_align_unchecked(capacity * size_of::<T>(), align_of::<T>()) ); } } else if len<self.capacity() { unsafe { infallible(self.raw.try_grow_raw(self.len, len)) }; }
+ }
+ 
+ pub fn shrink_to(&mut self, min_capacity: usize) {
+ if ! self.spilled() { return; }
+ if self.capacity()> min_capacity { let len = self.len(); let target = core::cmp::max(len, min_capacity); if target <= Self::inline_size() { unsafe { let(ptr, capacity) = self.raw.heap; self.raw = RawSmallVec::new_inline(MaybeUninit::uninit()); copy_nonoverlapping(ptr.as_ptr(), self.raw.as_mut_ptr_inline(), len); self.set_inline(); alloc::alloc::dealloc(ptr.cast().as_ptr(), Layout::from_size_align_unchecked(capacity * size_of::<T>(), align_of::<T>()) ); } } else if target < self.capacity() { unsafe { infallible(self.raw.try_grow_raw(self.len, target)) }; } }
+ }
+ 
+ pub fn truncate(&mut self, len: usize) {
+ let old_len = self.len();
+ if len<old_len { unsafe { self.set_len(len); core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(self.as_mut_ptr().add(len), old_len - len )) } }
+ }
+ 
+ pub fn swap_remove(&mut self, index: usize) -> T {
+ let len = self.len();
+ assert!(index < len, "swap_remove index(is {index}) should be<len(is {len})");
+ let new_len = len - 1;
+ unsafe { let value = core::ptr::read(self.as_ptr().add(index)); let base_ptr = self.as_mut_ptr(); core::ptr::copy(base_ptr.add(new_len), base_ptr.add(index), 1); self.set_len(new_len); value }
+ }
+ 
+ pub fn clear(&mut self) {
+ unsafe { let old_len = self.len(); self.set_len(0); core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(self.as_mut_ptr(), old_len )); }
+ }
+ 
+ pub fn remove(&mut self, index: usize) -> T {
+ let len = self.len();
+ assert!(index < len, "removal index(is {index}) should be < len(is {len})");
+ let new_len = len - 1;
+ unsafe { self.set_len(new_len); let ptr = self.as_mut_ptr(); let ith = ptr.add(index); let ith_item = ith.read(); copy(ith.add(1), ith, new_len - index); ith_item }
+ }
+ 
+ pub fn insert(&mut self, index: usize, value: T) {
+ let len = self.len();
+ assert!(index <= len, "insertion index(is {index}) should be <= len(is {len})");
+ self.reserve(1);
+ let ptr = self.as_mut_ptr();
+ unsafe { if index<len { copy(ptr.add(index), ptr.add(index + 1), len - index); } ptr.add(index).write(value); self.set_len(len + 1); }
+ }
+ 
+ pub fn as_slice(&self) -> &[T] {
+ let len = self.len();
+ let ptr = self.as_ptr();
+ unsafe { core::slice::from_raw_parts(ptr, len) }
+ }
+ 
+ pub fn as_mut_slice(&mut self) -> &mut [T] {
+ let len = self.len();
+ let ptr = self.as_mut_ptr();
+ unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+ }
+ 
+ pub fn as_ptr(&self) -> *const T {
+ if self.len.on_heap(Self::is_zst()) { unsafe { self.raw.as_ptr_heap() } } else { self.raw.as_ptr_inline() }
+ }
+ 
+ pub fn as_mut_ptr(&mut self) -> *mut T {
+ if self.len.on_heap(Self::is_zst()) { unsafe { self.raw.as_mut_ptr_heap() } } else { self.raw.as_mut_ptr_inline() }
+ }
+ 
+ pub fn into_vec(self) -> Vec<T> {
+ let len = self.len();
+ if ! self.spilled() { let mut vec = Vec::with_capacity(len); let this = ManuallyDrop::new(self); unsafe { copy_nonoverlapping(this.raw.as_ptr_inline(), vec.as_mut_ptr(), len); vec.set_len(len); } vec } else { let this = ManuallyDrop::new(self); unsafe { let(ptr, cap) = this.raw.heap; Vec::from_raw_parts(ptr.as_ptr(), len, cap) } }
+ }
+ 
+ pub fn into_boxed_slice(self) -> Box<[T]> {
+ self.into_vec().into_boxed_slice()
+ }
+ 
+ pub fn into_inner(self) -> Result<[T; N], Self> {
+ if self.len() != N { Err(self) } else { let mut this = self; unsafe { this.set_len(0); } let ptr = this.as_ptr() as * const [T; N]; unsafe { Ok(ptr.read()) } }
+ }
+ 
+ pub fn retain(&mut self, f: F) {
+ self.retain_mut(| elem | f(elem))
+ }
+ 
+ pub fn retain_mut(&mut self, f: F) {
+ let mut del = 0;
+ let len = self.len();
+ let ptr = self.as_mut_ptr();
+ for i in 0 .. len { unsafe { if ! f(&mut * ptr.add(i)) { del += 1; } else if del > 0 { core::ptr::swap(ptr.add(i), ptr.add(i - del)); } } }
+ self.truncate(len - del);
+ }
+ 
+ pub fn dedup(&mut self) {
+ self.dedup_by(| a, b | a == b);
+ }
+ 
+ pub fn dedup_by_key(&mut self, key: F) {
+ self.dedup_by(| a, b | key(a) == key(b));
+ }
+ 
+ pub fn dedup_by(&mut self, same_bucket: F) {
+ let len = self.len();
+ if len <= 1 { return; }
+ let ptr = self.as_mut_ptr();
+ let _ = 1;
+ unsafe { for r in 1 .. len { let p_r = ptr.add(r); let p_wm1 = ptr.add(w - 1); if ! same_bucket(&mut * p_r, &mut * p_wm1) { if r != w { let p_w = p_wm1.add(1); core::ptr::swap(p_r, p_w); } w += 1; } } }
+ self.truncate(w);
+ }
+ 
+ pub fn resize_with(&mut self, new_len: usize, f: F) {
+ let old_len = self.len();
+ if old_len<new_len { let mut f = f; let additional = new_len - old_len; self.reserve(additional); for _ in 0 .. additional { self.push(f()); } } else if old_len> new_len { self.truncate(new_len); }
+ }
+ 
+ pub fn leak(self) -> &mut [T] {
+ if ! self.spilled() { panic!("SmallVec::leak() called on inline(stack) SmallVec, which cannot be safely leaked"); }
+ let mut me = ManuallyDrop::new(self);
+ unsafe { core::slice::from_raw_parts_mut(me.as_mut_ptr(), me.len()) }
+ }
+ 
+ pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+ unsafe { core::slice::from_raw_parts_mut(self.as_mut_ptr().add(self.len()) as * mut MaybeUninit<T>, self.capacity() - self.len() ) }
+ }
+ 
+ pub fn from_raw_parts(ptr: *mut T, length: usize, capacity: usize) -> SmallVec<T, N> {
+ assert!(! Self::is_zst());
+ let ptr = unsafe { debug_assert!(! ptr.is_null(), "Called `from_raw_parts` with null pointer."); NonNull::new_unchecked(ptr) };
+ SmallVec { len: TaggedLen::new(length, true, Self::is_zst()), raw: RawSmallVec::new_heap(ptr, capacity), _marker: PhantomData }
+ }
+ 
+}
+
+impl<T: Clone, const N: usize> SmallVec<T, N> {
+ pub fn resize(&mut self, len: usize, value: T) {
+ let old_len = self.len();
+ if len > old_len { self.extend(core::iter::repeat_n(value, len - old_len)); } else { self.truncate(len); }
+ }
+ 
+ pub fn extend_from_slice(&mut self, other: &[T]) {
+ self.extend(other.iter())
+ }
+ 
+ pub fn extend_from_within(&mut self, src: R) {
+ let src = slice_range(src, .. self.len());
+ self.reserve(src.len());
+ unsafe { #[cfg(feature = "specialization")] { < Self as spec_traits::SpecExtendFromWithin<T> >::spec_extend_from_within(self, src); } #[cfg(not(feature = "specialization"))] { self.extend_from_within_fallback(src); } }
+ }
+ 
+ pub fn extend_from_slice_copy(&mut self, other: &[T]) {
+ let len = other.len();
+ let src = other.as_ptr();
+ let l = self.len();
+ self.reserve(len);
+ unsafe { let dst = self.as_mut_ptr().add(l); copy_nonoverlapping(src, dst, len); self.set_len(l + len); }
+ }
+ 
+ pub fn extend_from_within_copy(&mut self, src: R) {
+ let src = slice_range(src, .. self.len());
+ let _ = src;
+ let len = end - start;
+ self.reserve(len);
+ unsafe { let l = self.len(); let ptr = self.as_mut_ptr(); copy_nonoverlapping(ptr.add(start), ptr.add(l), len); self.set_len(l + len); }
+ }
+ 
+ pub fn insert_from_slice_copy(&mut self, index: usize, other: &[T]) {
+ let l = self.len();
+ let len = other.len();
+ assert!(index <= l);
+ self.reserve(len);
+ unsafe { let base_ptr = self.as_mut_ptr(); let ith_ptr = base_ptr.add(index); let shifted_ptr = base_ptr.add(index + len); copy(ith_ptr, shifted_ptr, l - index); copy_nonoverlapping(other.as_ptr(), ith_ptr, len); self.set_len(l + len); }
+ }
+ 
+ pub fn from_slice_copy(slice: &[T]) -> Self {
+ let src = slice.as_ptr();
+ let len = slice.len();
+ let mut result = Self::with_capacity(len);
+ unsafe { let dst = result.as_mut_ptr(); copy_nonoverlapping(src, dst, len); result.set_len(len); }
+ result
+ }
+ 
+}
+
+struct DropGuard<T> {
+ ptr: *mut T,
+ len: usize,
+}
+
+impl<T> Drop for DropGuard<T> {
+ fn drop(&mut self) {
+ unsafe { core::ptr::slice_from_raw_parts_mut(self.ptr, self.len).drop_in_place(); }
+ }
+ 
+}
+
+struct DropDealloc {
+ ptr: NonNull<u8>,
+ size_bytes: usize,
+ align: usize,
+}
+
+impl Drop for DropDealloc {
+ fn drop(&mut self) {
+ unsafe { if self.size_bytes > 0 { alloc::alloc::dealloc(self.ptr.as_ptr(), Layout::from_size_align_unchecked(self.size_bytes, self.align) ); } }
+ }
+ 
+}
+
+#[cfg(feature = "may_dangle")]
+unsafe impl<T, const N: usize> Drop for SmallVec<T, N> {
+ fn drop(&mut self) {
+ let on_heap = self.spilled();
+ let len = self.len();
+ let ptr = self.as_mut_ptr();
+ unsafe { let _drop_dealloc = if on_heap { let capacity = self.capacity(); Some(DropDealloc { ptr: NonNull::new_unchecked(ptr as * mut u8), size_bytes: capacity * size_of::<T>(), align: align_of::<T>() }) } else { None }; core::ptr::slice_from_raw_parts_mut(ptr, len).drop_in_place(); }
+ }
+ 
+}
+
+#[cfg(not(feature = "may_dangle"))]
+impl<T, const N: usize> Drop for SmallVec<T, N> {
+ fn drop(&mut self) {
+ let on_heap = self.spilled();
+ let len = self.len();
+ let ptr = self.as_mut_ptr();
+ unsafe { let _drop_dealloc = if on_heap { let capacity = self.capacity(); Some(DropDealloc { ptr: NonNull::new_unchecked(ptr as * mut u8), size_bytes: capacity * size_of::<T>(), align: align_of::<T>() }) } else { None }; core::ptr::slice_from_raw_parts_mut(ptr, len).drop_in_place(); }
+ }
+ 
+}
+
+impl<T, const N: usize> Drop for IntoIter<T, N> {
+ fn drop(&mut self) {
+ unsafe { let is_zst = size_of::<T>() == 0; let on_heap = self.end.on_heap(is_zst); let begin = self.begin; let end = self.end.value(is_zst); let ptr = self.as_mut_ptr(); let _drop_dealloc = if on_heap { let capacity = self.raw.heap.1; Some(DropDealloc { ptr: NonNull::new_unchecked(ptr as * mut u8), size_bytes: capacity * size_of::<T>(), align: align_of::<T>() }) } else { None }; core::ptr::slice_from_raw_parts_mut(ptr.add(begin), end - begin).drop_in_place(); }
+ }
+ 
+}
+
+impl<T, const N: usize> core::ops::Deref for SmallVec<T, N> {
+ type Target = [T];
+ fn deref(&self) -> &Self::Target {
+ self.as_slice()
+ }
+ 
+}
+
+impl<T, const N: usize> core::ops::DerefMut for SmallVec<T, N> {
+ fn deref_mut(&mut self) -> &mut Self::Target {
+ self.as_mut_slice()
+ }
+ 
+}
+
+/// This function is used in the [`smallvec`] macro.
+/// It is recommended to use the macro instead of using thís function.
+#[track_caller]
+pub fn from_elem<T: Clone, const N: usize>(elem: T, n: usize) -> SmallVec<T, N> {
+ if n > SmallVec::<T, N>::inline_size() { SmallVec::<T, N>::from_vec(vec ! [elem; n]) } else { #[cfg(feature = "specialization")] { unsafe { < SmallVec<T, N> as spec_traits::SpecFromElem<T> >::spec_from_elem(elem, n) } } #[cfg(not(feature = "specialization"))] { unsafe { SmallVec::<T, N>::from_elem_fallback(elem, n) } } }
+}
+
+#[cfg(feature = "specialization")]
+mod spec_traits {
+ use super::*;
+ /// A trait for specializing the implementation of [`from_elem`].
+ /// 
+ /// [`from_elem`]: crate::from_elem
+ trait SpecFromElem<T> {
+ fn spec_from_elem(elem: T, n: usize) -> Self;
+ }
+ 
+ impl<T: Clone, const N: usize> SpecFromElem<T> for SmallVec<T, N> {
+ fn spec_from_elem(elem: T, n: usize) -> Self {
+ unsafe { SmallVec::from_elem_fallback(elem, n) }
+ }
+ 
+ }
+ 
+ impl<T: Copy, const N: usize> SpecFromElem<T> for SmallVec<T, N> {
+ fn spec_from_elem(elem: T, n: usize) -> Self {
+ let mut result = Self::new();
+ if n > 0 { let ptr = result.raw.as_mut_ptr_inline(); unsafe { for i in 0 .. n { ptr.add(i).write(elem); } } }
+ unsafe { result.set_len(n); }
+ result
+ }
+ 
+ }
+ 
+ /// A trait for specializing the implementations of [`Extend`] and [`extend_from_slice`].
+ /// 
+ /// [`extend_from_slice`]: crate::SmallVec::extend_from_slice
+ trait SpecExtend<T, I> {
+ fn spec_extend(&mut self, iter: I);
+ }
+ 
+ impl<T, I, const N: usize> SpecExtend<T, I> for SmallVec<T, N> where I: Iterator<_> {
+ fn spec_extend(&mut self, iter: I) {
+ self.extend_fallback(iter);
+ }
+ 
+ }
+ 
+ impl<T, I, const N: usize> SpecExtend<T, I> for SmallVec<T, N> where I: core::iter::TrustedLen<_> {
+ fn spec_extend(&mut self, iter: I) {
+ let _ = iter.size_hint();
+ self.reserve(additional);
+ unsafe { let len = self.len(); let ptr = self.as_mut_ptr().add(len); let mut guard = DropGuard { ptr, len: 0 }; for x in iter { ptr.add(guard.len).write(x); guard.len += 1; } self.set_len(len + guard.len); core::mem::forget(guard); }
+ }
+ 
+ }
+ 
+ impl<T, const N: usize, const M: usize> SpecExtend<T, IntoIter<T, M>> for SmallVec<T, N> {
+ fn spec_extend(&mut self, iter: IntoIter<T, M>) {
+ let slice = iter.as_slice();
+ let len = slice.len();
+ let old_len = self.len();
+ self.reserve(len);
+ unsafe { let dst = self.as_mut_ptr().add(old_len); let src = slice.as_ptr(); copy_nonoverlapping(src, dst, len); }
+ unsafe { self.set_len(old_len + len); }
+ iter.begin = iter.end.value(Self::is_zst());
+ }
+ 
+ }
+ 
+ impl<a, T: a, const N: usize, I> SpecExtend<&T, I> for SmallVec<T, N> where I: Iterator<_>, T: Clone {
+ fn spec_extend(&mut self, iterator: I) {
+ self.spec_extend(iterator.cloned())
+ }
+ 
+ }
+ 
+ impl<a, T: a, const N: usize> SpecExtend<&T, core::slice::Iter<'a, T>> for SmallVec<T, N> where T: Copy {
+ fn spec_extend(&mut self, iter: core::slice::Iter<'a, T>) {
+ let slice = iter.as_slice();
+ let len = slice.len();
+ let old_len = self.len();
+ self.reserve(len);
+ unsafe { let dst = self.as_mut_ptr().add(old_len); let src = slice.as_ptr(); copy_nonoverlapping(src, dst, len); }
+ unsafe { self.set_len(old_len + len); }
+ }
+ 
+ }
+ 
+ /// A trait for specializing the implementation of [`extend_from_within`].
+ /// 
+ /// [`extend_from_within`]: crate::SmallVec::extend_from_within
+ trait SpecExtendFromWithin<T> {
+ fn spec_extend_from_within(&mut self, src: core::ops::Range<usize>);
+ }
+ 
+ impl<T: Clone, const N: usize> SpecExtendFromWithin<T> for SmallVec<T, N> {
+ fn spec_extend_from_within(&mut self, src: core::ops::Range<usize>) {
+ unsafe { self.extend_from_within_fallback(src); }
+ }
+ 
+ }
+ 
+ impl<T: Copy, const N: usize> SpecExtendFromWithin<T> for SmallVec<T, N> {
+ fn spec_extend_from_within(&mut self, src: core::ops::Range<usize>) {
+ let old_len = self.len();
+ let start = src.start;
+ let len = src.len();
+ unsafe { let ptr = self.as_mut_ptr(); let dst = ptr.add(old_len); let src = ptr.add(start); copy_nonoverlapping(src, dst, len); }
+ unsafe { self.set_len(old_len + len); }
+ }
+ 
+ }
+ 
+ /// A trait for specializing the implementation of [`FromIterator`].
+ /// 
+ /// [`clone_from`]: Clone::clone_from
+ trait SpecFromIterator<T, I> {
+ fn spec_from_iter(iter: I) -> Self;
+ }
+ 
+ impl<T, I, const N: usize> SpecFromIterator<T, I> for SmallVec<T, N> where I: Iterator<_> {
+ fn spec_from_iter(iter: I) -> Self {
+ Self::from_iter_fallback(iter)
+ }
+ 
+ }
+ 
+ impl<T, I, const N: usize> SpecFromIterator<T, I> for SmallVec<T, N> where I: core::iter::TrustedLen<_> {
+ fn spec_from_iter(iter: I) -> Self {
+ let mut v = match iter.size_hint() { (_, Some(upper)) => SmallVec::with_capacity(upper), _ => panic!("capacity overflow") };
+ v.spec_extend(iter);
+ v
+ }
+ 
+ }
+ 
+ /// A trait for specializing the implementation of [`clone_from`].
+ /// 
+ /// [`clone_from`]: Clone::clone_from
+ trait SpecCloneFrom<T> {
+ fn spec_clone_from(&mut self, source: &[T]);
+ }
+ 
+ impl<T: Clone, const N: usize> SpecCloneFrom<T> for SmallVec<T, N> {
+ fn spec_clone_from(&mut self, source: &[T]) {
+ self.clone_from_fallback(source);
+ }
+ 
+ }
+ 
+ impl<T: Copy, const N: usize> SpecCloneFrom<T> for SmallVec<T, N> {
+ fn spec_clone_from(&mut self, source: &[T]) {
+ self.clear();
+ self.extend_from_slice(source);
+ }
+ 
+ }
+ 
+ /// A trait for specializing the implementation of [`From`]
+ /// with the source type being slices.
+ trait SpecFromSlice<T> {
+ fn spec_from(slice: &[T]) -> Self;
+ }
+ 
+ impl<T: Clone, const N: usize> SpecFromSlice<T> for SmallVec<T, N> {
+ fn spec_from(slice: &[T]) -> Self {
+ unsafe { Self::from_slice_fallback(slice) }
+ }
+ 
+ }
+ 
+ impl<T: Copy, const N: usize> SpecFromSlice<T> for SmallVec<T, N> {
+ fn spec_from(slice: &[T]) -> Self {
+ let mut v = Self::new();
+ let src = slice.as_ptr();
+ let len = slice.len();
+ let dst = v.as_mut_ptr();
+ unsafe { copy_nonoverlapping(src, dst, len); }
+ unsafe { v.set_len(len); }
+ v
+ }
+ 
+ }
+ 
+}
+
+/// Fallback functions for various specialized methods. These are kept in
+/// a separate implementation block for easy access whenever specialization is disabled.
+impl<T, const N: usize> SmallVec<T, N> {
+ fn from_elem_fallback(elem: T, n: usize) -> Self {
+ let mut result = Self::new();
+ if n > 0 { let ptr = result.raw.as_mut_ptr_inline(); let mut guard = DropGuard { ptr, len: 0 }; unsafe { for i in 0 .. (n - 1) { ptr.add(i).write(elem.clone()); guard.len += 1; } core::mem::forget(guard); ptr.add(n - 1).write(elem); } }
+ unsafe { result.set_len(n); }
+ result
+ }
+ 
+ fn extend_fallback(&mut self, iter: I) {
+ let iter = iter.into_iter();
+ let _ = iter.size_hint();
+ self.reserve(size);
+ for x in iter { self.push(x); }
+ }
+ 
+ fn extend_from_within_fallback(&mut self, src: core::ops::Range<usize>) {
+ let old_len = self.len();
+ let start = src.start;
+ let len = src.len();
+ unsafe { let ptr = self.as_mut_ptr(); let dst = ptr.add(old_len); let src = ptr.add(start); let mut guard = DropGuard { ptr: dst, len: 0 }; for i in 0 .. len { let val = (*src.add(i)).clone(); dst.add(i).write(val); guard.len += 1; } core::mem::forget(guard); }
+ unsafe { self.set_len(old_len + len); }
+ }
+ 
+ fn from_iter_fallback(iter: I) -> Self {
+ let _ = iter.size_hint();
+ let mut v = Self::with_capacity(size);
+ for x in iter { v.push(x); }
+ v
+ }
+ 
+ fn clone_from_fallback(&mut self, source: &[T]) {
+ self.truncate(source.len());
+ let _ = unsafe { source.split_at_unchecked(self.len()) };
+ self.clone_from_slice(init);
+ self.extend(tail.iter().cloned());
+ }
+ 
+ fn from_slice_fallback(slice: &[T]) -> Self {
+ let mut v = Self::new();
+ let src = slice.as_ptr();
+ let len = slice.len();
+ let dst = v.as_mut_ptr();
+ unsafe { let mut guard = DropGuard { ptr: dst, len: 0 }; for i in 0 .. len { let val = (*src.add(i)).clone(); dst.add(i).write(val); guard.len += 1; } core::mem::forget(guard); }
+ unsafe { v.set_len(len); }
+ v
+ }
+ 
+}
+
+impl<T: Clone, const N: usize> From<&[T]> for SmallVec<T, N> {
+ fn from(slice: &[T]) -> Self {
+ if slice.len() > Self::inline_size() { Self::from_vec(Vec::from(slice)) } else { unsafe { #[cfg(feature = "specialization")] { < Self as spec_traits::SpecFromSlice<T> >::spec_from(slice) } #[cfg(not(feature = "specialization"))] { Self::from_slice_fallback(slice) } } }
+ }
+ 
+}
+
+impl<T: Clone, const N: usize> From<&mut [T]> for SmallVec<T, N> {
+ fn from(slice: &mut [T]) -> Self {
+ Self::from(slice as & [T])
+ }
+ 
+}
+
+impl<T: Clone, const M: usize, const N: usize> From<&[T; M]> for SmallVec<T, N> {
+ fn from(slice: &[T; M]) -> Self {
+ Self::from(slice as & [T])
+ }
+ 
+}
+
+impl<T: Clone, const M: usize, const N: usize> From<&mut [T; M]> for SmallVec<T, N> {
+ fn from(slice: &mut [T; M]) -> Self {
+ Self::from(slice as & [T])
+ }
+ 
+}
+
+impl<T, const N: usize, const M: usize> From<[T; M]> for SmallVec<T, N> {
+ fn from(array: [T; M]) -> Self {
+ if M > N { Self::from(Vec::from(array)) } else { let mut this = Self::new(); debug_assert!(M <= this.capacity()); let array = ManuallyDrop::new(array); unsafe { copy_nonoverlapping(array.as_ptr(), this.as_mut_ptr(), M); this.set_len(M); } this }
+ }
+ 
+}
+
+impl<T, const N: usize> From<Vec<T>> for SmallVec<T, N> {
+ fn from(array: Vec<T>) -> Self {
+ Self::from_vec(array)
+ }
+ 
+}
+
+impl<T: Clone, const N: usize> Clone for SmallVec<T, N> {
+ fn clone(&self) -> SmallVec<T, N> {
+ SmallVec::from(self.as_slice())
+ }
+ 
+ fn clone_from(&mut self, source: &Self) {
+ #[cfg(feature = "specialization")] { < Self as spec_traits::SpecCloneFrom<T> >::spec_clone_from(self, source); }
+ #[cfg(not(feature = "specialization"))] { self.clone_from_fallback(&*source); }
+ }
+ 
+}
+
+impl<T: Clone, const N: usize> Clone for IntoIter<T, N> {
+ fn clone(&self) -> IntoIter<T, N> {
+ SmallVec::from(self.as_slice()).into_iter()
+ }
+ 
+}
+
+impl<T, const N: usize> Extend<T> for SmallVec<T, N> {
+ fn extend(&mut self, iter: I) {
+ #[cfg(feature = "specialization")] { spec_traits::SpecExtend::<T, _>::spec_extend(self, iter.into_iter()); }
+ #[cfg(not(feature = "specialization"))] { self.extend_fallback(iter); }
+ }
+ 
+}
+
+impl<a, T: Clone + a, const N: usize> Extend<&T> for SmallVec<T, N> {
+ fn extend(&mut self, iter: I) {
+ #[cfg(feature = "specialization")] { spec_traits::SpecExtend::<&'a T, _>::spec_extend(self, iter.into_iter()); }
+ #[cfg(not(feature = "specialization"))] { self.extend_fallback(iter.into_iter().cloned()); }
+ }
+ 
+}
+
+impl<T, const N: usize> core::iter::FromIterator<T> for SmallVec<T, N> {
+ fn from_iter(iter: I) -> Self {
+ #[cfg(feature = "specialization")] { spec_traits::SpecFromIterator::<T, _>::spec_from_iter(iter.into_iter()) }
+ #[cfg(not(feature = "specialization"))] { Self::from_iter_fallback(iter.into_iter()) }
+ }
+ 
+}
+
+#[macro_export] macro_rules ! smallvec { (@ one $ x: expr) =>(1usize); () =>($ crate::SmallVec::new()); ($ elem: expr; $ n: expr) =>({ $ crate::from_elem($ elem, $ n) }); ($ ($ x: expr) ,+$ () ?) =>({ const COUNT: usize = 0usize $ (+ $ crate::smallvec!(@ one $ x)) +; let mut vec = $ crate::SmallVec::new(); if COUNT <= vec.capacity() { $ (vec.push($ x);) * vec } else { $ crate::SmallVec::from_vec($ crate::alloc::vec ! [$ ($ x ) +]) } }); }
+#[macro_export] macro_rules ! smallvec_inline { (@ one $ x: expr) =>(1usize); ($ elem: expr; $ n: expr) =>({ $ crate::SmallVec::<_, $ n>::from_buf([$ elem; $ n]) }); ($ ($ x: expr) ,+ $ () ?) =>({ const N: usize = 0usize $ (+ $ crate::smallvec_inline!(@ one $ x)) *; $ crate::SmallVec::<_, N>::from_buf([$ ($ x ) *]) }); }
+impl<T, const N: usize> IntoIterator for SmallVec<T, N> {
+ type IntoIter = IntoIter<T, N>;
+ type Item = T;
+ fn into_iter(self) -> Self::IntoIter {
+ unsafe { let this = ManuallyDrop::new(self); IntoIter { raw: (&this.raw as * const RawSmallVec<T, N>).read(), begin: 0, end: this.len, _marker: PhantomData } }
+ }
+ 
+}
+
+impl<a, T, const N: usize> IntoIterator for &SmallVec<T, N> {
+ type IntoIter = core::slice::Iter<'a, T>;
+ type Item = &T;
+ fn into_iter(self) -> Self::IntoIter {
+ self.iter()
+ }
+ 
+}
+
+impl<a, T, const N: usize> IntoIterator for &mut SmallVec<T, N> {
+ type IntoIter = core::slice::IterMut<'a, T>;
+ type Item = &mut T;
+ fn into_iter(self) -> Self::IntoIter {
+ self.iter_mut()
+ }
+ 
+}
+
+impl<T, U, const N: usize, const M: usize> PartialEq<SmallVec<U, M>> for SmallVec<T, N> where T: PartialEq<U> {
+ fn eq(&self, other: &SmallVec<U, M>) -> bool {
+ self.as_slice().eq(other.as_slice())
+ }
+ 
+}
+
+impl<T, const N: usize> Eq for SmallVec<T, N> where T: Eq {
+}
+
+impl<T, U, const N: usize, const M: usize> PartialEq<[U; M]> for SmallVec<T, N> where T: PartialEq<U> {
+ fn eq(&self, other: &[U; M]) -> bool {
+ self [..] == other [..]
+ }
+ 
+}
+
+impl<T, U, const N: usize, const M: usize> PartialEq<&[U; M]> for SmallVec<T, N> where T: PartialEq<U> {
+ fn eq(&self, other: &&[U; M]) -> bool {
+ self [..] == other [..]
+ }
+ 
+}
+
+impl<T, U, const N: usize> PartialEq<[U]> for SmallVec<T, N> where T: PartialEq<U> {
+ fn eq(&self, other: &[U]) -> bool {
+ self [..] == other [..]
+ }
+ 
+}
+
+impl<T, U, const N: usize> PartialEq<&[U]> for SmallVec<T, N> where T: PartialEq<U> {
+ fn eq(&self, other: &&[U]) -> bool {
+ self [..] == other [..]
+ }
+ 
+}
+
+impl<T, U, const N: usize> PartialEq<&mut [U]> for SmallVec<T, N> where T: PartialEq<U> {
+ fn eq(&self, other: &&mut [U]) -> bool {
+ self [..] == other [..]
+ }
+ 
+}
+
+impl<T, const N: usize> PartialOrd for SmallVec<T, N> where T: PartialOrd {
+ fn partial_cmp(&self, other: &SmallVec<T, N>) -> Option<core::cmp::Ordering> {
+ self.as_slice().partial_cmp(other.as_slice())
+ }
+ 
+}
+
+impl<T, const N: usize> Ord for SmallVec<T, N> where T: Ord {
+ fn cmp(&self, other: &SmallVec<T, N>) -> core::cmp::Ordering {
+ self.as_slice().cmp(other.as_slice())
+ }
+ 
+}
+
+impl<T: Hash, const N: usize> Hash for SmallVec<T, N> {
+ fn hash(&self, state: &mut H) {
+ self.as_slice().hash(state)
+ }
+ 
+}
+
+impl<T, const N: usize> Borrow<[T]> for SmallVec<T, N> {
+ fn borrow(&self) -> &[T] {
+ self.as_slice()
+ }
+ 
+}
+
+impl<T, const N: usize> BorrowMut<[T]> for SmallVec<T, N> {
+ fn borrow_mut(&mut self) -> &mut [T] {
+ self.as_mut_slice()
+ }
+ 
+}
+
+impl<T, const N: usize> AsRef<[T]> for SmallVec<T, N> {
+ fn as_ref(&self) -> &[T] {
+ self.as_slice()
+ }
+ 
+}
+
+impl<T, const N: usize> AsMut<[T]> for SmallVec<T, N> {
+ fn as_mut(&mut self) -> &mut [T] {
+ self.as_mut_slice()
+ }
+ 
+}
+
+impl<T: Debug, const N: usize> Debug for SmallVec<T, N> {
+ fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+ f.debug_list().entries(self.iter()).finish()
+ }
+ 
+}
+
+impl<T: Debug, const N: usize> Debug for IntoIter<T, N> {
+ fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+ f.debug_tuple("IntoIter").field(&self.as_slice()).finish()
+ }
+ 
+}
+
+impl<T: Debug, const N: usize> Debug for Drain<'_, T, N> {
+ fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+ f.debug_tuple("Drain").field(&self.iter.as_slice()).finish()
+ }
+ 
+}
+
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+impl<T, const N: usize> Serialize for SmallVec<T, N> where T: Serialize {
+ fn serialize(&self, serializer: S) -> Result<S::Ok, S::Error> {
+ let mut state = serializer.serialize_seq(Some(self.len())) ?;
+ for item in self { state.serialize_element(item) ?; }
+ state.end()
+ }
+ 
+}
+
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+impl<de, T, const N: usize> Deserialize<de> for SmallVec<T, N> where T: Deserialize<de> {
+ fn deserialize(deserializer: D) -> Result<Self, D::Error> {
+ deserializer.deserialize_seq(SmallVecVisitor { phantom: PhantomData })
+ }
+ 
+}
+
+#[cfg(feature = "serde")]
+struct SmallVecVisitor<T, const N: usize> {
+ phantom: PhantomData<T>,
+}
+
+#[cfg(feature = "serde")]
+impl<de, T, const N: usize> Visitor<de> for SmallVecVisitor<T, N> where T: Deserialize<de> {
+ type Value = SmallVec<T, N>;
+ fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+ formatter.write_str("a sequence")
+ }
+ 
+ fn visit_seq(self, seq: B) -> Result<Self::Value, B::Error> {
+ use serde_core::de::Error;
+ let len = seq.size_hint().unwrap_or(0);
+ let mut values = SmallVec::new();
+ values.try_reserve(len).map_err(B::Error::custom) ?;
+ while let Some(value) = seq.next_element() ? { values.push(value); }
+ Ok(values)
+ }
+ 
+}
+
+#[cfg(feature = "malloc_size_of")]
+impl<T, const N: usize> MallocShallowSizeOf for SmallVec<T, N> {
+ fn shallow_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+ if self.spilled() { unsafe { ops.malloc_size_of(self.as_ptr()) } } else { 0 }
+ }
+ 
+}
+
+#[cfg(feature = "malloc_size_of")]
+impl<T: MallocSizeOf, const N: usize> MallocSizeOf for SmallVec<T, N> {
+ fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+ let mut n = self.shallow_size_of(ops);
+ for elem in self.iter() { n += elem.size_of(ops); }
+ n
+ }
+ 
+}
+
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+impl<const N: usize> io::Write for SmallVec<u8, N> {
+ fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+ self.extend_from_slice(buf);
+ Ok(buf.len())
+ }
+ 
+ fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+ self.extend_from_slice(buf);
+ Ok(())
+ }
+ 
+ fn flush(&mut self) -> io::Result<()> {
+ Ok(())
+ }
+ 
+}
+
+#[cfg(feature = "bytes")]
+unsafe impl<const N: usize> BufMut for SmallVec<u8, N> {
+ fn remaining_mut(&self) -> usize {
+ isize::MAX as usize - self.len()
+ }
+ 
+ fn advance_mut(&mut self, cnt: usize) {
+ let len = self.len();
+ let remaining = self.capacity() - len;
+ if remaining<cnt { panic!("advance out of bounds: the len is {remaining} but advancing by {cnt}"); }
+ self.set_len(len + cnt);
+ }
+ 
+ fn chunk_mut(&mut self) -> &mut UninitSlice {
+ if self.capacity() == self.len() { self.reserve(64); }
+ let cap = self.capacity();
+ let len = self.len();
+ let ptr = self.as_mut_ptr();
+ unsafe { UninitSlice::from_raw_parts_mut(ptr.add(len), cap - len) }
+ }
+ 
+ fn put(&mut self, src: T) {
+ self.reserve(src.remaining());
+ while src.has_remaining() { let s = src.chunk(); let l = s.len(); self.extend_from_slice(s); src.advance(l); }
+ }
+ 
+ fn put_slice(&mut self, src: &[u8]) {
+ self.extend_from_slice(src);
+ }
+ 
+ fn put_bytes(&mut self, val: u8, cnt: usize) {
+ let new_len = self.len().saturating_add(cnt);
+ self.resize(new_len, val);
+ }
+ 
+}
+
